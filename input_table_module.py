@@ -1,3 +1,4 @@
+from decimal import Decimal
 import tkinter as tk
 import csv
 from tkinter import filedialog, messagebox
@@ -65,14 +66,14 @@ class InputTable:
         
         if self.mode == "Isometric":
             self.create_spinbox(self.spinbox_frame, "Torque Target (Nm):", 0, 0)
-            # self.create_spinbox(self.spinbox_frame, "Pretension (Nm):", 0, 2)
+  
         elif self.mode == "Isotonic":
             self.create_spinbox(self.spinbox_frame, "Range of Motion (deg):", 0, 0)
-            # self.create_spinbox(self.spinbox_frame, "Pretension (Nm):", 0, 2)
+
         elif self.mode == "Isokinetic":
             self.create_spinbox(self.spinbox_frame, "Min Torque Threshold (Nm):", 0, 0)
             self.create_spinbox(self.spinbox_frame, "Range of Motion (deg):", 0, 2)
-            # self.create_spinbox(self.spinbox_frame, "Pretension (Nm):", 0, 4)
+           
 
         
 
@@ -317,10 +318,15 @@ class InputTable:
         
         graph_window = tk.Toplevel(self.root)
         graph_window.title("Live Graph")
+        graph_window.geometry("1400x900")        # ← set window size: width x height
+        graph_window.minsize(800, 600)           # ← optional: enforce a minimum size
 
-        fig, ax = plt.subplots(figsize=(10, 4))
+        # bigger figure
+        fig, ax = plt.subplots(figsize=(12, 8), dpi=100)  
         canvas = FigureCanvasTkAgg(fig, master=graph_window)
-        canvas.get_tk_widget().pack()
+        # make the plot fill the window
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
 
         frame_rate = 30
         window_seconds = 4
@@ -331,64 +337,115 @@ class InputTable:
         input_data = np.zeros(window_size)
         torque_data = np.full(window_size, np.nan)
 
-        input_line, = ax.plot(time_data, input_data, label="Planned Input", color="blue", linewidth=10)
-        torque_line, = ax.plot(time_data, torque_data, label="Live Torque", color="orange", linewidth=10)
+               # choose labels based on mode
+        if self.mode in ("Isotonic", "Isokinetic"):
+            planned_lbl = "Planned Position (%)"
+            live_lbl    = "Live Position (%)"
+            ylabel      = "Position (%)"
+        else:
+            planned_lbl = "Planned Input"
+            live_lbl    = "Live Torque (%)"
+            ylabel      = "Torque (%)"
 
-        # ax.axvline(0, color="black", linestyle="--")
+        input_line, = ax.plot(
+            time_data, input_data,
+            label=planned_lbl,
+            color="blue",
+            linewidth=10
+        )
+        torque_line, = ax.plot(
+            time_data, torque_data,
+            label=live_lbl,
+            color="orange",
+            linewidth=10
+        )
 
         ax.set_ylim(0, 110)
-        # ax.set_xlim(-window_seconds, 0)
-        ax.set_xlim(-2,2)
+        ax.set_xlim(-2, 2)
         ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Torque")
+        ax.set_ylabel(ylabel)
         ax.legend()
         ax.grid(True)
+
 
         index = 0
         torque_tag = 'matlabTorque'
         center_index = window_size // 2
+        self.last_velocity_limit = None
 
         def update(frame):
             nonlocal index, center_index
 
+            # Stop when signal ends
             if index >= full_length:
                 if self.ani:
                     self.ani.event_source.stop()
-
-                # Disable test mode
                 if self.plc:
                     self.plc.disable_test_mode()
-                    
-                    
-                    
-
                 return [input_line, torque_line]
 
+            # Slide window of planned input
             input_data[:-1] = input_data[1:]
-            next_input = full_signal[index]
-            input_data[-1] = next_input
+            input_data[-1] = full_signal[index]
 
+            # Slide window of live data up to center
             torque_data[:center_index] = torque_data[1:center_index+1]
 
+            if self.mode == "Isokinetic":
+                next_vel = full_signal[index]
+                is_last = (index == full_length - 1)
+                # only write when stepping into a non-zero speed,
+                # or when you're at the very end and need to drop to zero
+                if (next_vel > 0 and next_vel != self.last_velocity_limit) or (is_last and next_vel == 0):
+                    self.plc.write('matlabVelocityLimit', int(next_vel))
+                    self.last_velocity_limit = next_vel
+
+            # Read raw PLC value
             try:
                 if self.plc:
-                    result = self.plc.read(torque_tag)
-                    torque_val = float(result.value) if result and result.value is not None else 0
+                    if self.mode in ("Isotonic", "Isokinetic"):
+                        tag = 'matlabPosition'
+                    else:
+                        tag = 'matlabTorque'
+                    result = self.plc.read(tag)
+                    raw_val = float(result.value) if result and result.value is not None else 0
                 else:
-                    torque_val = 0
+                    raw_val = 0
             except Exception as e:
                 print(f"PLC Read Error: {e}")
-                torque_val = 0
+                raw_val = 0
 
-            torque_data[center_index] = torque_val
+            # Choose denominator spinbox key
+            if self.mode in ("Isotonic", "Isokinetic"):
+                key = "Range of Motion (deg)"
+            elif self.mode == "Isometric":
+                key = "Torque Target (Nm)"
+            else:
+                key = None
 
-            torque_data[center_index + 1 :] = np.nan
+            # Compute percentage or raw
+            if key and key in self.spinboxes:
+                denom = float(self.spinboxes[key].get()) or 1
+                scaled = 100 * raw_val / denom
+            else:
+                scaled = raw_val
 
+            # Insert into center of window
+            torque_data[center_index] = scaled
+
+            # Update plot lines
             input_line.set_ydata(input_data)
             torque_line.set_ydata(torque_data)
 
             index += 1
             return [input_line, torque_line]
+
+
+            # input_line.set_ydata(input_data)
+            # torque_line.set_ydata(torque_data)
+
+            # index += 1
+            # return [input_line, torque_line]
 
         self.ani = animation.FuncAnimation(
             fig,
@@ -408,5 +465,3 @@ if __name__ == "__main__":
     root.geometry("1200x800")
     app = InputTable(root)
     root.mainloop()
-
-
