@@ -1,4 +1,6 @@
+from datetime import datetime
 from decimal import Decimal
+import os
 import tkinter as tk
 import csv
 from tkinter import filedialog, messagebox
@@ -8,14 +10,24 @@ import matplotlib.animation as animation
 import numpy as np
 import time
 from plc_interface import PLCInterface
+import threading
 
+plc_lock= threading.Lock()
 
 class InputTable:
-    def __init__(self, root, mode=None, plc=None):
+    def __init__(self, root, mode=None, plc=None, lock = plc_lock):
         self.root = root
         self.mode = mode
         self.plc=plc
         self.ani = None
+        self.plc_lock = lock
+        self.csv_index = 1
+
+
+        self.log_buffer = []
+        self.flush_interval = 15  # frames
+        self.frame_counter  = 0
+
         if mode == "Isometric":
             self.columns = ["Name", "Time(s)", "Target (% of Max Torque)", "Cont. Time(s)", "Rest Time(s)", "Enable"]
         elif mode == "Isotonic":
@@ -315,6 +327,15 @@ class InputTable:
 
         full_signal = self.build_test_plan()  # build signal first
         full_length = len(full_signal)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mode_safe = self.mode.replace(" ", "")
+        os.makedirs("logs", exist_ok=True)
+        self.csv_filename = f"logs/{mode_safe}_{ts}.csv"
+        with open(self.csv_filename, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Index", "Time Stamp", "Position", "Torque", "Velocity", "Torque Error"])
+
         
         graph_window = tk.Toplevel(self.root)
         graph_window.title("Live Graph")
@@ -382,6 +403,14 @@ class InputTable:
                     self.ani.event_source.stop()
                 if self.plc:
                     self.plc.disable_test_mode()
+
+
+                if self.log_buffer:
+                    with open(self.csv_filename, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerows(self.log_buffer)
+                    self.log_buffer.clear()
+
                 return [input_line, torque_line]
 
             # Slide window of planned input
@@ -400,20 +429,64 @@ class InputTable:
                     self.plc.write('matlabVelocityLimit', int(next_vel))
                     self.last_velocity_limit = next_vel
 
-            # Read raw PLC value
-            try:
-                if self.plc:
-                    if self.mode in ("Isotonic", "Isokinetic"):
-                        tag = 'matlabPosition'
-                    else:
-                        tag = 'matlabTorque'
-                    result = self.plc.read(tag)
-                    raw_val = float(result.value) if result and result.value is not None else 0
-                else:
-                    raw_val = 0
-            except Exception as e:
-                print(f"PLC Read Error: {e}")
-                raw_val = 0
+            if self.mode in ("Isotonic", "Isokinetic"):
+                tag = 'matlabPosition'
+            else:
+                tag = 'matlabTorque'
+
+            # # Read raw PLC value
+            # try:
+            #     if self.plc:
+            #         if self.mode in ("Isotonic", "Isokinetic"):
+            #             tag = 'matlabPosition'
+            #         else:
+            #             tag = 'matlabTorque'
+            #         result = self.plc.read(tag)
+            #         raw_val = float(result.value) if result and result.value is not None else 0
+            #     else:
+            #         raw_val = 0
+            # except Exception as e:
+            #     print(f"PLC Read Error: {e}")
+            #     raw_val = 0
+
+
+                # ———————— SINGLE-LOCK READ & LOG ————————
+            with self.plc_lock:
+                # 1) live tag for plotting
+                result  = self.plc.read(tag)
+                raw_val = float(result.value or 0)
+
+                # 2) check/reset DataCacheMatlab
+                data_matrix = []
+                flag = self.plc.read("NewDataFlag").value
+                if flag == 1:
+                    for r in range(6):
+                        row = [self.plc.read(f"DataCacheMatlab[{r},{c}]").value or 0 for c in range(10)]
+                        data_matrix.append(row)
+                    self.plc.write("NewDataFlag", 0)
+
+            # 3) append any rows to CSV immediately
+            # write one CSV row per sample (column)
+            for c in range(10):
+                pos    = data_matrix[0][c]
+                torque = data_matrix[1][c]
+                vel    = data_matrix[2][c]
+                terr   = data_matrix[3][c]
+                self.log_buffer.append([
+                    float(self.csv_index), ts, pos, torque, vel, terr
+                ])
+                self.csv_index += 1
+
+            # every flush_interval frames, dump to disk in one shot
+            self.frame_counter += 1
+            if self.frame_counter >= self.flush_interval:
+                with open(self.csv_filename, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(self.log_buffer)
+                self.log_buffer.clear()
+                self.frame_counter = 0
+# ————————————————————————————————————————
+
 
             # Choose denominator spinbox key
             if self.mode in ("Isotonic", "Isokinetic"):
@@ -463,5 +536,5 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.title("Input Table")
     root.geometry("1200x800")
-    app = InputTable(root)
+    app = InputTable(root, plc=PLCInterface(...), lock = plc_lock)
     root.mainloop()
